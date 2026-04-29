@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+asyncpg
+sqlalchemy[asyncio]
+redis
+httpx
+faster_whisper
+python-dotenv
+python-multipart
+pypdf
+pydantic
+pytest-asyncio
+google-generativeai

@@ -126,7 +126,24 @@ function connectWS() {
 
   ws.onmessage = (evt) => {
     removeTyping();
-    renderBotResponse(JSON.parse(evt.data));
+    const data = JSON.parse(evt.data);
+    const waitMsg = document.getElementById("hitlWaitMsg");
+    if (waitMsg && data.type !== "hitl_wait") {
+      waitMsg.remove();
+    }
+
+    if      (data.type === "hitl_answer")  renderHitlAnswer(data);
+    else if (data.type === "hitl_timeout") addBotMessage(data.chat || data.answer);
+    else if (data.type === "hitl_wait") {
+      const el = document.createElement("div");
+      el.className = "msg bot hitl-wait-msg";
+      el.id = "hitlWaitMsg";
+      el.innerHTML = `<div class="msg-bubble">${escHtml(data.message)}</div>`;
+      chat.appendChild(el);
+      scrollBottom();
+    }
+    else if (data.type === "pdf_answer")   renderMultiPdfAnswer(data);
+    else                                   renderBotResponse(data);
   };
 
   ws.onclose = () => {
@@ -183,24 +200,26 @@ function setConnState(s) {
   }
 }
 
-// ── Send ──────────────────────────────────────────────────────
 function sendMessage() {
   const text = msgInput.value.trim();
   if (!text) return;
   msgInput.value = "";
   startChat();
 
-  if (storedPdfs.length > 0) {
-    // Always route to PDF store Q&A if any PDFs are stored
-    sendPdfStoreQuestion(text);
-  } else {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      addBotMessage("⚠ Not connected. Please wait…"); return;
-    }
-    addUserMessage(text);
-    showTyping();
-    ws.send(text);
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    addBotMessage("⚠ Not connected. Please wait…"); return;
   }
+  
+  addUserMessage(text);
+  showTyping();
+
+  const ids = activePdfIds.size > 0 ? Array.from(activePdfIds) : null;
+  ws.send(JSON.stringify({ 
+    type: "query", 
+    text: text,
+    has_pdfs: storedPdfs.length > 0,
+    pdf_ids: ids 
+  }));
 }
 msgInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
@@ -346,41 +365,6 @@ function askAboutPage(pdfId, pageNum, filename) {
   activePdfIds.add(pdfId);
   renderPdfStore();
   msgInput.focus();
-}
-
-// ── Ask Q&A across stored PDFs ────────────────────────────────
-async function sendPdfStoreQuestion(question) {
-  addUserMessage(question);
-  showTyping();
-
-  // resolve which pdf_ids to search
-  const ids = activePdfIds.size > 0 ? Array.from(activePdfIds) : null;
-
-  try {
-    const res = await fetch(`${API_URL}/ask-pdfs`, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ question, pdf_ids: ids }),
-    });
-
-    if (!res.ok) throw new Error(`Server ${res.status}: ${await res.text()}`);
-    const data = await res.json();
-    removeTyping();
-
-    if (data.type === "not_in_pdf") {
-      // fall through to agent pipeline
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        addBotMessage("⚠ Not in PDFs and not connected to agents."); return;
-      }
-      showTyping();
-      ws.send(question);
-    } else {
-      renderMultiPdfAnswer(data);
-    }
-  } catch (err) {
-    removeTyping();
-    addBotMessage(`⚠ PDF Q&A failed: ${err.message}`);
-  }
 }
 
 // ── Render multi-PDF answer with source cards ─────────────────
@@ -724,3 +708,16 @@ async function clearAllCache() {
 const _style = document.createElement("style");
 _style.textContent = `@keyframes spin { to { transform: rotate(360deg); } }`;
 document.head.appendChild(_style);
+
+
+// ── Render the final HITL answer ─────────────────────────────
+function renderHitlAnswer(data) {
+  const answer  = data.answer || data.chat || "(no response)";
+
+  const html = `
+    <div class="msg-bubble hitl-answer-bubble">
+      ${formatResponse(answer)}
+    </div>`;
+
+  _appendMsg("bot", html);
+}

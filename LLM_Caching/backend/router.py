@@ -1,5 +1,7 @@
 import os
 import uuid
+import json
+import asyncio
 import datetime
 import tempfile
 from fastapi import APIRouter, WebSocket, UploadFile, File, WebSocketDisconnect, Form, HTTPException
@@ -8,11 +10,12 @@ from typing import List, Optional
 from backend.agents.audio import audio_agent
 from backend.agents.video import video_agent
 from backend.agents.pdf_agent import pdf_agent, answer_question
-from backend.agents.pdf_store import store_pdf, delete_pdf, list_pdfs, get_pdf_meta
+from backend.agents.pdf_store import store_pdf, delete_pdf, list_pdfs, get_pdf_meta, query_pdfs
 from backend.db import AsyncSessionLocal
 from backend.models import AiTaskMemory
 from backend.process_task import process_task
 from backend.core.semantic_cache import redis, INDEX_KEY, CACHE_PREFIX, STATS_KEY, get_cost_savings
+from backend.core.hitl_manager import create_review, await_feedback, submit_feedback
 
 router = APIRouter(tags=["router"])
 
@@ -21,18 +24,254 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @router.websocket("/ws")
 async def websocket_text(ws: WebSocket):
+    """
+    Unified WebSocket for both standard chat and Human-in-the-Loop retrieval.
+
+    Protocol:
+      FE → BE: {"type": "query",        "text": "..."}
+      BE → FE: {"type": "hitl_review",  "review_id": "...", "question": "...", "sources": [...]}
+      FE → BE: {"type": "hitl_feedback","review_id": "...", "approved_ids": [...], "note": ""}
+      BE → FE: {"type": "hitl_answer",  "answer": "...", "chat": "...", "sources": [...]}
+      (or standard agent responses for non-sensitive queries)
+    """
     await ws.accept()
+    recv_queue: asyncio.Queue = asyncio.Queue()
+
+    async def _receiver():
+        """Continuously read from the WebSocket and push into the queue."""
+        try:
+            while True:
+                raw = await ws.receive_text()
+                try:
+                    await recv_queue.put(json.loads(raw))
+                except json.JSONDecodeError:
+                    await recv_queue.put({"type": "query", "text": raw})
+        except WebSocketDisconnect:
+            await recv_queue.put(None)
+        except Exception as e:
+            print(f"[WS] Receiver error: {e}")
+            await recv_queue.put(None)
+
+    recv_task = asyncio.create_task(_receiver())
+    try:
+        from backend.core.gemini_client import ask_gemini
+        
+        while True:
+            msg = await recv_queue.get()
+            if msg is None:
+                break  # client disconnected
+
+            msg_type = msg.get("type", "query")
+
+            if msg_type == "hitl_feedback":
+                # Route feedback to the suspended _run_hitl coroutine
+                ok = submit_feedback(msg.get("review_id", ""), msg)
+                if not ok:
+                    print(f"[HITL] Unknown review_id: {msg.get('review_id')}")
+            else:
+                text = msg.get("text", "").strip()
+                if text:
+                    # Run in a background task so the receiver stays active
+                    async def _handle_query(ws, text):
+                        # Determine if query is sensitive
+                        prompt = (
+                            f"Is the following question sensitive, dangerous, inappropriate, "
+                            f"or does it require human review (e.g. asking for personal info, destructive actions)? "
+                            f"Answer ONLY 'YES' or 'NO'.\n\nQuestion: {text}"
+                        )
+                        is_sensitive_resp = await ask_gemini(prompt)
+                        is_sensitive = "YES" in is_sensitive_resp.upper()
+
+                        if is_sensitive:
+                            print(f"[HITL] Query flagged as sensitive: {text}")
+                            await _run_hitl(ws, text)
+                        else:
+                            has_pdfs = msg.get("has_pdfs", False)
+                            pdf_ids = msg.get("pdf_ids")
+                            
+                            if has_pdfs:
+                                result = await answer_question(text, pdf_ids=pdf_ids)
+                                # If PDF search says it's not in the PDF, fall back to normal process_task
+                                if result.get("type") == "not_in_pdf":
+                                    async with AsyncSessionLocal() as session:
+                                        result = await process_task(text, session)
+                            else:
+                                async with AsyncSessionLocal() as session:
+                                    result = await process_task(text, session)
+                            await ws.send_json(result)
+
+                    asyncio.create_task(_handle_query(ws, text))
+    except Exception as e:
+        print(f"[WS] Dispatcher error: {e}")
+    finally:
+        recv_task.cancel()
+        try:
+            await recv_task
+        except asyncio.CancelledError:
+            pass
+        print("Client disconnected (Unified WS)")
+
+
+# ── HITL helpers ──────────────────────────────────────────────
+
+async def _run_hitl(ws: WebSocket, question: str) -> None:
+    """
+    Full Human-in-the-Loop pipeline for a single question.
+    1. Retrieve candidate sources (PDF store → research fallback)
+    2. Send hitl_review to frontend and suspend
+    3. Receive approved source IDs from human
+    4. Generate LLM answer from approved sources only
+    5. Send hitl_answer back
+    """
+    from backend.agents.research import research_agent
+    from backend.core.gemini_client import ask_gemini
+
+    review_id = str(uuid.uuid4())
+    sources: list = []
+
+    # ── 1. Retrieval ──────────────────────────────────────────
+    try:
+        pdfs = await list_pdfs()
+        if pdfs:
+            hits = await query_pdfs(question, top_k_per_pdf=5, score_threshold=0.40)
+            for i, h in enumerate(hits[:10]):
+                sources.append({
+                    "id":          i,
+                    "source_type": "pdf",
+                    "pdf_id":      h["pdf_id"],
+                    "filename":    h["filename"],
+                    "page":        h["page"],
+                    "score":       h["score"],
+                    "text":        h["text"][:500],
+                })
+    except Exception as e:
+        print(f"[HITL] PDF retrieval error: {e}")
+
+    if not sources:
+        try:
+            raw = await research_agent(question)
+            chunks = [c.strip() for c in str(raw).split("\n\n") if len(c.strip()) > 40][:8]
+            for i, chunk in enumerate(chunks):
+                sources.append({
+                    "id":          i,
+                    "source_type": "research",
+                    "title":       f"Research Result #{i + 1}",
+                    "text":        chunk[:500],
+                })
+        except Exception as e:
+            print(f"[HITL] Research retrieval error: {e}")
+
+    if not sources:
+        await ws.send_json({
+            "type":    "hitl_answer",
+            "answer":  "No relevant information could be retrieved for this question.",
+            "chat":    "No relevant information could be retrieved for this question.",
+            "sources": [],
+        })
+        return
+
+    # ── 2. Generate Draft Answer ──────────────────────────────
+    context = "\n\n---\n\n".join(
+        "[Source {}: {} {}]\n{}".format(
+            s["id"] + 1,
+            s.get("filename") or s.get("title", "Research"),
+            ("• Page " + str(s["page"])) if "page" in s else "",
+            s["text"],
+        )
+        for s in sources
+    )
+
+    prompt = (
+        f"You are an expert assistant. Answer the question using ONLY the sources below.\n"
+        f"IMPORTANT: Do NOT include any citations like [Source 1] or a 'Sources' section at the end. Provide ONLY the answer text.\n\n"
+        f"Sources:\n---\n{context}\n---\n\nQuestion: {question}"
+    )
+    draft_answer = await ask_gemini(prompt)
+
+    # ── 3. Ask Admin to review ────────────────────────────────
+    create_review(review_id, question=question, draft_answer=draft_answer, sources=sources)
+    await ws.send_json({
+        "type":      "hitl_wait",
+        "message":   "⏳ Sensitive topic detected. Waiting for admin approval..."
+    })
+
+    # ── 4. Wait for Admin approval (1 hour timeout) ───────────
+    feedback = await await_feedback(review_id, timeout=3600.0)
+
+    if not feedback:
+        await ws.send_json({
+            "type":   "hitl_timeout",
+            "answer": "⏱ Admin review timed out. Please try again later.",
+            "chat":   "⏱ Admin review timed out. Please try again later.",
+            "sources": [],
+        })
+        return
+
+    # ── 5. Process Admin Feedback ─────────────────────────────
+    action = feedback.get("action", "reject")
+    edited_answer = feedback.get("edited_answer", "")
+
+    out_sources = [
+        {
+            "filename": s.get("filename") or s.get("title", "Research"),
+            "page":     s.get("page"),
+            "score":    s.get("score"),
+        }
+        for s in sources
+    ]
+
+    if action == "approve":
+        final_answer = draft_answer
+    elif action == "edit":
+        final_answer = edited_answer
+    else:
+        # action == "reject"
+        final_answer = "❌ The admin has rejected this sensitive query."
+        out_sources = []
+
+    await ws.send_json({
+        "type":    "hitl_answer",
+        "answer":  final_answer,
+        "chat":    final_answer,
+        "sources": out_sources,
+    })
+
+
+
+
+
+@router.get("/admin/reviews")
+async def get_admin_reviews():
+    """Admin endpoint to fetch all pending sensitive reviews."""
+    from backend.core.hitl_manager import get_all_pending
+    return {"reviews": get_all_pending()}
+
+class AdminFeedbackRequest(BaseModel):
+    action: str  # "approve", "edit", "reject"
+    edited_answer: str = ""
+
+@router.post("/admin/reviews/{review_id}")
+async def submit_admin_feedback(review_id: str, req: AdminFeedbackRequest):
+    """Admin endpoint to resolve a pending review."""
+    from backend.core.hitl_manager import submit_feedback
+    ok = submit_feedback(review_id, req.dict())
+    if not ok:
+        raise HTTPException(status_code=404, detail="Review ID not found or already processed")
+    return {"status": "success", "message": f"Review {review_id} resolved with action {req.action}"}
+
+@router.websocket("/admin/ws")
+async def admin_ws(ws: WebSocket):
+    """WebSocket for Admin Dashboard to push queue updates without polling log spam."""
+    await ws.accept()
+    from backend.core.hitl_manager import get_all_pending
     try:
         while True:
-            text = await ws.receive_text()
-            async with AsyncSessionLocal() as session:
-                result = await process_task(text, session)
-            await ws.send_json(result)
+            await ws.send_json({"reviews": get_all_pending()})
+            await asyncio.sleep(3)
     except WebSocketDisconnect:
-        print("Client disconnected (text WS)")
+        pass
     except Exception as e:
-        print(f"WebSocket error: {e}")
-
+        print(f"[Admin WS] Error: {e}")
 
 @router.websocket("/ws/mic")
 async def websocket_mic(ws: WebSocket):

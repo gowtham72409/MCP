@@ -14,7 +14,7 @@ from backend.agents.pdf_store import store_pdf, delete_pdf, list_pdfs, get_pdf_m
 from backend.db import AsyncSessionLocal
 from backend.models import AiTaskMemory
 from backend.process_task import process_task
-from backend.core.semantic_cache import redis, INDEX_KEY, CACHE_PREFIX, STATS_KEY, get_cost_savings
+from backend.core.semantic_cache import redis, INDEX_KEY, CACHE_PREFIX, STATS_KEY, get_cost_savings, get_cache, set_cached, record_cache_hit, record_cache_miss
 from backend.core.hitl_manager import create_review, await_feedback, submit_feedback
 
 router = APIRouter(tags=["router"])
@@ -73,6 +73,19 @@ async def websocket_text(ws: WebSocket):
                 if text:
                     # Run in a background task so the receiver stays active
                     async def _handle_query(ws, text):
+                        has_pdfs = msg.get("has_pdfs", False)
+                        pdf_ids = msg.get("pdf_ids")
+
+                        # Pre-check cache to see if there's a cached HITL response or a general response
+                        cached = await get_cache(text)
+                        if cached:
+                            # If it's a hitl_answer, ALWAYS use it to bypass the admin queue again.
+                            # If it's not a PDF query, use it as a standard general cache hit.
+                            if cached.get("type") == "hitl_answer" or not has_pdfs:
+                                await record_cache_hit(cached.get("usage", {}))
+                                await ws.send_json(cached)
+                                return
+
                         # Determine if query is sensitive
                         prompt = (
                             f"Is the following question sensitive, dangerous, inappropriate, "
@@ -86,8 +99,6 @@ async def websocket_text(ws: WebSocket):
                             print(f"[HITL] Query flagged as sensitive: {text}")
                             await _run_hitl(ws, text)
                         else:
-                            has_pdfs = msg.get("has_pdfs", False)
-                            pdf_ids = msg.get("pdf_ids")
                             
                             if has_pdfs:
                                 result = await answer_question(text, pdf_ids=pdf_ids)
@@ -229,12 +240,21 @@ async def _run_hitl(ws: WebSocket, question: str) -> None:
         final_answer = "❌ The admin has rejected this sensitive query."
         out_sources = []
 
-    await ws.send_json({
+    result_dict = {
         "type":    "hitl_answer",
         "answer":  final_answer,
         "chat":    final_answer,
         "sources": out_sources,
-    })
+    }
+
+    # Store approved/edited HITL responses in the semantic cache
+    if action in ("approve", "edit"):
+        try:
+            await set_cached(question, result_dict)
+        except Exception as e:
+            print(f"[HITL Cache] Error storing to cache: {e}")
+
+    await ws.send_json(result_dict)
 
 
 

@@ -64,29 +64,23 @@ async def websocket_text(ws: WebSocket):
             msg_type = msg.get("type", "query")
 
             if msg_type == "hitl_feedback":
-                # Route feedback to the suspended _run_hitl coroutine
                 ok = submit_feedback(msg.get("review_id", ""), msg)
                 if not ok:
                     print(f"[HITL] Unknown review_id: {msg.get('review_id')}")
             else:
                 text = msg.get("text", "").strip()
                 if text:
-                    # Run in a background task so the receiver stays active
                     async def _handle_query(ws, text):
                         has_pdfs = msg.get("has_pdfs", False)
                         pdf_ids = msg.get("pdf_ids")
 
-                        # Pre-check cache to see if there's a cached HITL response or a general response
                         cached = await get_cache(text)
                         if cached:
-                            # If it's a hitl_answer, ALWAYS use it to bypass the admin queue again.
-                            # If it's not a PDF query, use it as a standard general cache hit.
                             if cached.get("type") == "hitl_answer" or not has_pdfs:
                                 await record_cache_hit(cached.get("usage", {}))
                                 await ws.send_json(cached)
                                 return
 
-                        # Determine if query is sensitive
                         prompt = (
                             f"Is the following question sensitive, dangerous, inappropriate, "
                             f"or does it require human review (e.g. asking for personal info, destructive actions)? "
@@ -102,7 +96,6 @@ async def websocket_text(ws: WebSocket):
                             
                             if has_pdfs:
                                 result = await answer_question(text, pdf_ids=pdf_ids)
-                                # If PDF search says it's not in the PDF, fall back to normal process_task
                                 if result.get("type") == "not_in_pdf":
                                     async with AsyncSessionLocal() as session:
                                         result = await process_task(text, session)
@@ -123,8 +116,6 @@ async def websocket_text(ws: WebSocket):
         print("Client disconnected (Unified WS)")
 
 
-# ── HITL helpers ──────────────────────────────────────────────
-
 async def _run_hitl(ws: WebSocket, question: str) -> None:
     """
     Full Human-in-the-Loop pipeline for a single question.
@@ -140,7 +131,7 @@ async def _run_hitl(ws: WebSocket, question: str) -> None:
     review_id = str(uuid.uuid4())
     sources: list = []
 
-    # ── 1. Retrieval ──────────────────────────────────────────
+  
     try:
         pdfs = await list_pdfs()
         if pdfs:
@@ -181,7 +172,7 @@ async def _run_hitl(ws: WebSocket, question: str) -> None:
         })
         return
 
-    # ── 2. Generate Draft Answer ──────────────────────────────
+
     context = "\n\n---\n\n".join(
         "[Source {}: {} {}]\n{}".format(
             s["id"] + 1,
@@ -199,14 +190,14 @@ async def _run_hitl(ws: WebSocket, question: str) -> None:
     )
     draft_answer = await ask_gemini(prompt)
 
-    # ── 3. Ask Admin to review ────────────────────────────────
+    
     create_review(review_id, question=question, draft_answer=draft_answer, sources=sources)
     await ws.send_json({
         "type":      "hitl_wait",
         "message":   "⏳ Sensitive topic detected. Waiting for admin approval..."
     })
 
-    # ── 4. Wait for Admin approval (1 hour timeout) ───────────
+   
     feedback = await await_feedback(review_id, timeout=3600.0)
 
     if not feedback:
@@ -218,7 +209,6 @@ async def _run_hitl(ws: WebSocket, question: str) -> None:
         })
         return
 
-    # ── 5. Process Admin Feedback ─────────────────────────────
     action = feedback.get("action", "reject")
     edited_answer = feedback.get("edited_answer", "")
 
@@ -236,8 +226,7 @@ async def _run_hitl(ws: WebSocket, question: str) -> None:
     elif action == "edit":
         final_answer = edited_answer
     else:
-        # action == "reject"
-        final_answer = "❌ The admin has rejected this sensitive query."
+        final_answer = " The admin has rejected this sensitive query."
         out_sources = []
 
     result_dict = {
@@ -247,7 +236,7 @@ async def _run_hitl(ws: WebSocket, question: str) -> None:
         "sources": out_sources,
     }
 
-    # Store approved/edited HITL responses in the semantic cache
+
     if action in ("approve", "edit"):
         try:
             await set_cached(question, result_dict)
@@ -257,9 +246,6 @@ async def _run_hitl(ws: WebSocket, question: str) -> None:
     await ws.send_json(result_dict)
 
 
-
-
-
 @router.get("/admin/reviews")
 async def get_admin_reviews():
     """Admin endpoint to fetch all pending sensitive reviews."""
@@ -267,7 +253,7 @@ async def get_admin_reviews():
     return {"reviews": get_all_pending()}
 
 class AdminFeedbackRequest(BaseModel):
-    action: str  # "approve", "edit", "reject"
+    action: str  
     edited_answer: str = ""
 
 @router.post("/admin/reviews/{review_id}")

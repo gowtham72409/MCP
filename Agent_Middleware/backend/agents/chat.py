@@ -15,10 +15,9 @@ async def chat_agent(task: str, memory: dict) -> str:
     pdf_ctx      = f"\n\nPDF Content (indexed):\n{memory['pdf']}" if memory.get("pdf") else ""
     fs_ctx       = f"\n\nFile System Actions:\n{memory['fs']}"    if memory.get("fs")       else ""
 
-    prompt = f"""You are TalkBuddy, a highly intelligent and helpful AI assistant orchestrating a powerful multi-agent system.
-You are the final step in the pipeline. Your job is to synthesize all available context and agent outputs into a clear, natural, and helpful response for the user.
+    prompt = f"""You are TalkBuddy, a helpful AI assistant. Synthesize the available context below into a clear, direct answer for the user.
 
-Available System Context:
+Available Context:
 {mcp_context}
 {research_ctx}
 {code_ctx}
@@ -28,10 +27,10 @@ Available System Context:
 User Request: {task}
 
 Guidelines:
-1. Carefully synthesize the above context to answer the user's request seamlessly.
-2. Do not just blindly paste raw JSON or unformatted text. Reformat data into a conversational, easy-to-read response using markdown (e.g., bolding, lists, code blocks).
-3. If MCP data (like HubSpot CRM) or PDF text is present, prioritize answering the user's question using that specific data.
-4. Be concise but comprehensive. Maintain a helpful, polite, and professional tone.
+1. Answer directly and concisely. Stop when the question is answered — do not pad.
+2. Format with markdown (lists, bold, code blocks) where it improves readability.
+3. If MCP or PDF data is present, prioritise it to answer the question.
+4. Maintain a helpful, professional tone.
 """
 
     return await ask_gemini(prompt)

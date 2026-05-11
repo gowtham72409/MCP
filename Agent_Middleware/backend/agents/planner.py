@@ -23,7 +23,7 @@ User Task:
 {user_input}
 """
 
-    response = await ask_gemini(prompt)
+    response = await ask_gemini(prompt, max_output_tokens=80)
 
     try:
         response = response.replace("```json", "").replace("```", "").strip()

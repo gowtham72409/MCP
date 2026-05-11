@@ -2,18 +2,15 @@ from backend.core.gemini_client import ask_gemini
 
 async def research_agent(task):
     prompt = f"""You are an expert Research AI Agent in a multi-agent system.
-Your objective is to provide comprehensive, factual, and deeply analytical responses to the user's query.
+Provide an accurate, concise, and well-structured answer to the user's query.
 
 Guidelines:
-1. Provide accurate, well-structured, and highly informative data.
-2. Break down complex concepts into easily understandable parts.
-3. Be highly objective. If the topic requires it, offer step-by-step logic, historical context, or scientific facts.
-4. Avoid superficial answers. Dive deep into the nuances.
+1. Be factual and objective.
+2. Use clear structure (bullet points or short paragraphs). Avoid padding.
+3. Cover all key points but omit unnecessary elaboration.
 
-User Query for Research:
+User Query:
 {task}
-
-Please provide your detailed research report below:
 """
     return await ask_gemini(prompt)
 

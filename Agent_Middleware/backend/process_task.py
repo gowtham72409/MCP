@@ -11,7 +11,7 @@ from backend.agents.chat import chat_agent
 from backend.agents.memory import save_task_memory
 from backend.agents.fs_agent import fs_agent
 from backend.core.semantic_cache import get_cache, set_cached, record_cache_hit, record_cache_miss
-from backend.core.gemini_client import task_usage
+from backend.core.gemini_client import task_usage, hitl_is_sensitive, ask_gemini
 
 
 async def process_task(
@@ -31,13 +31,29 @@ async def process_task(
             await record_cache_hit(cached.get("usage", {}))
             return {**cached, "task_id": task_id, "from_cache": True}
 
+   
+    sensitivity_resp = await ask_gemini(
+        "Is this task sensitive, dangerous, or inappropriate? "
+        "Answer with a single word: YES or NO.\n\nTask: " + user_input,
+        max_output_tokens=1,
+    )
+    hitl_is_sensitive.set("YES" in sensitivity_resp.upper())
+
     mcp_tool   = await resolve_tool(user_input)
     mcp_result = None
     if mcp_tool:
         mcp_result = await call_mcp_tool(mcp_tool["tool"], mcp_tool["params"])
 
-    from backend.core.middleware import AgentRunner, LoggingMiddleware, RetryMiddleware, ValidationMiddleware, HITLMiddleware
-    runner = AgentRunner([LoggingMiddleware(), RetryMiddleware(retries=3), ValidationMiddleware(), HITLMiddleware()])
+    from backend.core.middleware import (
+        AgentRunner, LoggingMiddleware, RetryMiddleware,
+        ValidationMiddleware, HITLMiddleware,
+    )
+    runner = AgentRunner([
+        LoggingMiddleware(),
+        RetryMiddleware(retries=3),
+        ValidationMiddleware(),
+        HITLMiddleware(),
+    ])
 
     agents  = await runner.run(planner_agent, user_input)
     results = {}
@@ -57,14 +73,15 @@ async def process_task(
 
     if mcp_result:
         results["mcp"] = json.dumps(mcp_result)
-
     if pdf_context:
         results["pdf"] = pdf_context
-
     if media_type:
         results[media_type] = user_input
 
-    evaluation    = await runner.run(evaluation_agent, results)
+    evaluation = None
+    if results:
+        evaluation = await runner.run(evaluation_agent, results)
+
     chat_response = await runner.run(chat_agent, user_input, results)
 
     if media_type and file_bytes:
@@ -87,4 +104,5 @@ async def process_task(
     if not pdf_context:
         await record_cache_miss(response.get("usage", {}))
         await set_cached(user_input, response)
+
     return response

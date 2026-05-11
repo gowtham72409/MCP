@@ -7,20 +7,30 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 call_counter = {"count": 0, "total_tokens": 0}
 task_usage = contextvars.ContextVar('task_usage', default=None)
+# Pre-computed once per request; read by HITLMiddleware to avoid per-agent LLM calls
+hitl_is_sensitive = contextvars.ContextVar('hitl_is_sensitive', default=None)
 
-async def ask_gemini(prompt: str, max_retries: int = 5):
+async def ask_gemini(prompt: str, max_retries: int = 5, max_output_tokens: int = None):
     """
     Call Gemini and return the response text.
-    Token counts are stored as attributes on the returned string object so
-    callers that don't care about tokens keep working unchanged.
+    - max_output_tokens: cap response length (use small values for YES/NO checks).
+    - thinking_budget=0: disables Gemini 2.5 Flash extended thinking to remove
+      hidden latency and billed thinking tokens on every call.
     """
     last_error = None
+    config = {
+        "system_instruction": "You are an intelligent AI agent system.",
+        "thinking_config": {"thinking_budget": 0},
+    }
+    if max_output_tokens is not None:
+        config["max_output_tokens"] = max_output_tokens
+
     for attempt in range(max_retries):
         try:
             response = await client.aio.models.generate_content(
-                model="gemini-2.5-flash", 
+                model="gemini-2.5-flash",
                 contents=prompt,
-                config={"system_instruction": "You are an intelligent AI agent system."},
+                config=config,
             )
 
             usage = getattr(response, 'usage_metadata', None)

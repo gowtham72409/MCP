@@ -13,7 +13,7 @@ class _Review:
         self.draft_answer = draft_answer
         self.sources = sources or []
         self.created_at = time.time()
-
+        
 
 _pending: Dict[str, _Review] = {}
 

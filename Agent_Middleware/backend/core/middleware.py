@@ -37,48 +37,50 @@ class RetryMiddleware(AgentMiddleware):
 
 class ValidationMiddleware(AgentMiddleware):
     async def __call__(self, call_next, *args, **kwargs):
-        # Validate that the first argument is a non-empty string, assuming the task is the first arg
         if args and isinstance(args[0], str) and not args[0].strip():
             agent_name = getattr(call_next, '__name__', 'unknown_agent')
             raise ValueError(f"Agent {agent_name} received empty task input")
         return await call_next(*args, **kwargs)
 
 class HITLMiddleware(AgentMiddleware):
+    _SKIP_AGENTS = {"planner_agent", "evaluation_agent", "audio_agent", "video_agent", "answer_question"}
+
     async def __call__(self, call_next, *args, **kwargs):
-        from backend.core.gemini_client import ask_gemini
+        from backend.core.gemini_client import ask_gemini, hitl_is_sensitive
         from backend.core.hitl_manager import create_review, await_feedback
         import uuid
         import os
 
         agent_name = getattr(call_next, '__name__', 'unknown_agent')
 
-        task = ""
+        if agent_name in self._SKIP_AGENTS:
+            return await call_next(*args, **kwargs)
+
         if agent_name == "pdf_agent":
             task = kwargs.get("question", "")
-        elif agent_name in ("audio_agent", "video_agent", "answer_question"):
-            # These agents just transcribe or retrieve answers, no dangerous actions
-            return await call_next(*args, **kwargs)
         else:
             task = args[0] if args and isinstance(args[0], str) else kwargs.get("task", "")
 
         if not task or (isinstance(task, str) and os.path.exists(task)):
             return await call_next(*args, **kwargs)
 
-        prompt = (
-            f"Is the following task sensitive, dangerous, inappropriate, "
-            f"or does it require human review (e.g. asking for personal info, destructive actions)? "
-            f"Answer ONLY 'YES' or 'NO'.\n\nTask: {task}"
-        )
-        is_sensitive_resp = await ask_gemini(prompt)
-        is_sensitive = "YES" in is_sensitive_resp.upper()
+        is_sensitive = hitl_is_sensitive.get()
+        if is_sensitive is None:
+            resp = await ask_gemini(
+                f"Is this task sensitive or dangerous? Answer ONLY 'YES' or 'NO'.\n\nTask: {task}",
+                max_output_tokens=1,
+            )
+            is_sensitive = "YES" in resp.upper()
 
         if not is_sensitive:
             return await call_next(*args, **kwargs)
 
         logger.info(f"[HITL] Agent '{agent_name}' intercepted sensitive task: {task}")
 
-        draft_prompt = f"Provide a brief draft response or outline the intended action for this sensitive task handled by {agent_name}:\nTask: {task}"
-        draft_answer = await ask_gemini(draft_prompt)
+        draft_answer = await ask_gemini(
+            f"Briefly outline the intended action for this sensitive task handled by {agent_name}:\nTask: {task}",
+            max_output_tokens=256,
+        )
 
         review_id = str(uuid.uuid4())
         create_review(review_id, question=task, draft_answer=draft_answer, sources=[])
@@ -96,7 +98,7 @@ class HITLMiddleware(AgentMiddleware):
             logger.info(f"[HITL] Admin approved action for {review_id}")
             return await call_next(*args, **kwargs)
         elif action == "edit":
-            logger.info(f"[HITL] Admin edited action for {review_id}. Bypassing execution and returning edited answer.")
+            logger.info(f"[HITL] Admin edited response for {review_id}.")
             return feedback.get("edited_answer", "")
         else:
             logger.info(f"[HITL] Admin rejected action for {review_id}")
